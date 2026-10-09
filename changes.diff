@@ -1,0 +1,2100 @@
+diff --git a/compiler/rustc_feature/src/unstable.rs b/compiler/rustc_feature/src/unstable.rs
+index 8397cd29..847b8b8f 100644
+--- a/compiler/rustc_feature/src/unstable.rs
++++ b/compiler/rustc_feature/src/unstable.rs
+@@ -510,6 +510,8 @@ pub fn internal(&self, feature: Symbol) -> bool {
+     (unstable, ffi_const, "1.45.0", Some(58328)),
+     /// Allows the use of `#[ffi_pure]` on foreign functions.
+     (unstable, ffi_pure, "1.45.0", Some(58329)),
++    /// my  feature
++    (unstable, ffi_sanitizer, "1.92.0", None),
+     /// Controlling the behavior of fmt::Debug
+     (unstable, fmt_debug, "1.82.0", Some(129709)),
+     /// Allows using `#[align(...)]` on function items
+diff --git a/compiler/rustc_mir_transform/src/ffi_sanitizer.rs b/compiler/rustc_mir_transform/src/ffi_sanitizer.rs
+new file mode 100644
+index 00000000..46961127
+--- /dev/null
++++ b/compiler/rustc_mir_transform/src/ffi_sanitizer.rs
+@@ -0,0 +1,522 @@
++// #![allow(dead_code)]
++// #![allow(warnings)]
++
++use rustc_abi::ExternAbi;
++use rustc_hir::Attribute;
++use rustc_hir::attrs::AttributeKind;
++use rustc_middle::mir::interpret::Scalar;
++use rustc_middle::mir::visit::{PlaceContext, Visitor};
++use rustc_middle::mir::{self, *};
++use rustc_middle::ty::{self, Ty, TyCtxt};
++use rustc_span::DUMMY_SP;
++use rustc_span::source_map::{Spanned, dummy_spanned};
++use rustc_span::symbol::{Symbol, sym};
++
++pub(super) struct FFISanitizer;
++
++impl<'tcx> crate::MirPass<'tcx> for FFISanitizer {
++    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
++        if !tcx.features().ffi_sanitizer() {
++            return;
++        }
++        if has_ffi_call(tcx, body) {
++            println!("FFISanitizer");
++            instrument_func_with_ffi_call(tcx, body);
++        } else if can_be_ffi_call(tcx, body) {
++            println!("FFISanitizer");
++            instrument_func_can_be_ffi_call(tcx, body);
++        }
++        if is_main_function(tcx, body) {
++            instrument_main_func(tcx, body);
++        }
++    }
++
++    fn is_required(&self) -> bool {
++        true
++    }
++}
++
++fn is_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, func: &Operand<'tcx>) -> bool {
++    if let ty::FnDef(def_id, _) = func.ty(body, tcx).kind() {
++        return tcx.is_foreign_item(*def_id);
++    }
++    return false;
++}
++
++fn has_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> bool {
++    for (_, block) in body.basic_blocks.iter_enumerated() {
++        let Some(terminator) = &block.terminator else { continue };
++        if let TerminatorKind::Call { func, .. } = &terminator.kind {
++            if is_ffi_call(tcx, body, func) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
++fn can_be_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> bool {
++    let def_id = body.source.def_id().expect_local();
++
++    let mut no_mangle = tcx.has_attr(def_id, sym::no_mangle);
++    for attr in tcx.get_all_attrs(def_id).iter() {
++        if let Attribute::Parsed(parsed) = attr {
++            no_mangle |= match parsed {
++                AttributeKind::NoMangle(_) => true,
++                AttributeKind::ExportName { .. } => true,
++                _ => false,
++            };
++        }
++    }
++
++    if no_mangle
++        && tcx.visibility(def_id).is_public()
++        && let ExternAbi::C { .. } = tcx.fn_sig(def_id).skip_binder().abi()
++    {
++        return true;
++    }
++    return false;
++}
++
++fn is_main_function<'tcx>(tcx: TyCtxt<'_>, body: &Body<'tcx>) -> bool {
++    let def_id = body.source.def_id().expect_local();
++
++    if let Some((entry_def_id, _)) = tcx.entry_fn(()) {
++        entry_def_id == def_id.to_def_id()
++    } else {
++        false
++    }
++}
++
++fn get_temp_local<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> Place<'tcx> {
++    let local_decl = LocalDecl::new(tcx.types.unit, DUMMY_SP);
++    let local = body.local_decls.push(local_decl);
++    Place::from(local)
++}
++
++fn instrument_func_with_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
++    for current in START_BLOCK..body.basic_blocks.next_index() {
++        match &body[current].terminator().kind {
++            TerminatorKind::Call { func, .. } => {
++                if is_ffi_call(tcx, body, func) {
++                    instrument_ffi_call(tcx, body, current)
++                } else {
++                    instrument_ptr_use_term(tcx, body, current);
++                }
++            }
++            TerminatorKind::Return { .. } => instrument_return(tcx, body, current),
++            TerminatorKind::TailCall { .. } => instrument_ptr_use_term(tcx, body, current),
++            TerminatorKind::Drop { .. } => instrument_drop(tcx, body, current), // may never execute
++            _ => {}
++        }
++
++        let len = body[current].statements.len();
++        for statement_index in (0..len).rev() {
++            let loc = Location { block: current, statement_index };
++
++            let mut visitor = DerefVisitor { vars: Vec::new() };
++            visitor.visit_statement(&body[current].statements[statement_index], loc);
++
++            let mut args = Vec::new();
++            while let Some(arg) = visitor.vars.pop() {
++                if matches!(arg.ty(&body.local_decls, tcx).ty.kind(), ty::RawPtr(..)) {
++                    println!("pointer deref {:?}", arg);
++                    args.push(arg);
++                }
++            }
++
++            if !args.is_empty() {
++                let stmts = body[current].statements.split_off(statement_index);
++                instrument_ptr_use_stmt(tcx, body, current, stmts, args);
++            }
++        }
++    }
++}
++
++fn select_raw_ptr_args<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    body: &mut Body<'tcx>,
++    args: &Box<[Spanned<Operand<'tcx>>]>,
++) -> Vec<(Ty<'tcx>, Spanned<Operand<'tcx>>)> {
++    let mut func_args = Vec::new();
++    for arg in args.iter() {
++        match &arg.node {
++            Operand::Copy(place) | Operand::Move(place) => {
++                let base_place = mir::Place { local: place.local, projection: ty::List::empty() };
++                if let ty::RawPtr(pty, _) = base_place.ty(&body.local_decls, tcx).ty.kind() {
++                    func_args.push((pty.clone(), arg.clone()));
++                }
++            }
++            _ => {}
++        }
++    }
++    return func_args;
++}
++
++fn instrument_return<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, current: BasicBlock) {
++    let ty::RawPtr(pty, _) = body.return_ty().kind() else { return };
++    let ret_place = Place::return_place();
++
++    let pre_cond_fn_name = "ffi_sanitizer_use_pre_cond";
++    let pre_cond_fn_symbol = Symbol::intern(pre_cond_fn_name);
++    let Some(pre_cond_fn_def_id) = tcx.get_diagnostic_item(pre_cond_fn_symbol) else { return };
++
++    let block = BasicBlockData::new(Some(body[current].terminator().clone()), false);
++    let ret_bb = body.basic_blocks_mut().push(block);
++
++    let source_info = body[current].terminator().source_info;
++    let pre_cond_fn =
++        Operand::function_handle(tcx, pre_cond_fn_def_id, [pty.clone().into()], source_info.span);
++
++    let fn_arg = dummy_spanned(Operand::Copy(ret_place));
++    body[current].terminator_mut().kind = TerminatorKind::Call {
++        func: pre_cond_fn,
++        args: [fn_arg].into(),
++        destination: get_temp_local(tcx, body),
++        target: Some(ret_bb),
++        unwind: UnwindAction::Unreachable,
++        call_source: CallSource::Misc,
++        fn_span: DUMMY_SP,
++    };
++}
++
++fn instrument_ptr_use_term<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, current: BasicBlock) {
++    let pre_cond_args = match body[current].terminator().kind.clone() {
++        TerminatorKind::Call { args, .. } | TerminatorKind::TailCall { args, .. } => {
++            select_raw_ptr_args(tcx, body, &args)
++        }
++        _ => Vec::new(),
++    };
++
++    if pre_cond_args.is_empty() {
++        return;
++    }
++
++    let source_info = body[current].terminator().source_info;
++    let pre_cond_fn_name = "ffi_sanitizer_use_pre_cond";
++    let pre_cond_fn_symbol = Symbol::intern(pre_cond_fn_name);
++    let Some(pre_cond_fn_def_id) = tcx.get_diagnostic_item(pre_cond_fn_symbol) else { return };
++
++    let mut pre_cond_bb = Vec::new();
++    for (generic_arg, func_arg) in pre_cond_args.iter().cloned() {
++        let pre_cond_fn = Operand::function_handle(
++            tcx,
++            pre_cond_fn_def_id,
++            [generic_arg.into()],
++            source_info.span,
++        );
++
++        let terminator = Terminator {
++            source_info,
++            kind: TerminatorKind::Call {
++                func: pre_cond_fn,
++                args: [func_arg.into()].into(),
++                destination: get_temp_local(tcx, body),
++                target: Some(BasicBlock::ZERO),
++                unwind: UnwindAction::Continue,
++                call_source: CallSource::Misc,
++                fn_span: DUMMY_SP,
++            },
++        };
++
++        let block = BasicBlockData::new(Some(terminator), false);
++        let bb = body.basic_blocks_mut().push(block);
++        pre_cond_bb.push(bb);
++    }
++
++    let block = BasicBlockData::new(Some(body[current].terminator().clone()), false);
++    let last_bb = body.basic_blocks_mut().push(block);
++
++    if let Some(terminator) = body[current].terminator.as_mut() {
++        *terminator = Terminator {
++            source_info,
++            kind: TerminatorKind::Goto { target: *pre_cond_bb.first().unwrap() },
++        };
++    }
++
++    for (idx, &pre_bb) in pre_cond_bb.iter().enumerate() {
++        let target = if let Some(val) = pre_cond_bb.get(idx + 1) { *val } else { last_bb };
++        body[pre_bb].terminator_mut().successors_mut(|bb| *bb = target);
++    }
++}
++
++fn instrument_ptr_use_stmt<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    body: &mut Body<'tcx>,
++    current: BasicBlock,
++    stmts: Vec<Statement<'tcx>>,
++    args: Vec<Place<'tcx>>,
++) {
++    let source_info = body[current].terminator().source_info;
++    let pre_cond_fn_name = "ffi_sanitizer_use_pre_cond";
++    let pre_cond_fn_symbol = Symbol::intern(pre_cond_fn_name);
++    let Some(pre_cond_fn_def_id) = tcx.get_diagnostic_item(pre_cond_fn_symbol) else { return };
++
++    let mut pre_cond_bb = Vec::new();
++    for arg in args.iter().cloned() {
++        let ty::RawPtr(pty, _) = arg.ty(&body.local_decls, tcx).ty.kind() else {
++            panic!("not raw pointer");
++        };
++
++        let pre_cond_fn = Operand::function_handle(
++            tcx,
++            pre_cond_fn_def_id,
++            [pty.clone().into()],
++            source_info.span,
++        );
++
++        let terminator = Terminator {
++            source_info,
++            kind: TerminatorKind::Call {
++                func: pre_cond_fn,
++                args: [dummy_spanned(Operand::Copy(arg))].into(),
++                destination: get_temp_local(tcx, body),
++                target: Some(BasicBlock::ZERO),
++                unwind: UnwindAction::Continue,
++                call_source: CallSource::Misc,
++                fn_span: DUMMY_SP,
++            },
++        };
++
++        let block = BasicBlockData::new(Some(terminator), false);
++        let bb = body.basic_blocks_mut().push(block);
++        pre_cond_bb.push(bb);
++    }
++
++    let block = BasicBlockData::new_stmts(stmts, Some(body[current].terminator().clone()), false);
++    let last_bb = body.basic_blocks_mut().push(block);
++
++    if let Some(terminator) = body[current].terminator.as_mut() {
++        *terminator = Terminator {
++            source_info,
++            kind: TerminatorKind::Goto { target: *pre_cond_bb.first().unwrap() },
++        };
++    }
++
++    for (idx, &pre_bb) in pre_cond_bb.iter().enumerate() {
++        let target = if let Some(val) = pre_cond_bb.get(idx + 1) { *val } else { last_bb };
++        body[pre_bb].terminator_mut().successors_mut(|bb| *bb = target);
++    }
++}
++
++fn instrument_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, current: BasicBlock) {
++    let TerminatorKind::Call { func, args, destination, target, unwind, call_source, fn_span } =
++        body[current].terminator().kind.clone()
++    else {
++        return;
++    };
++
++    // get pre condition
++    let pre_cond_fn_name = "ffi_sanitizer_ffi_pre_cond";
++    let pre_cond_fn_symbol = Symbol::intern(pre_cond_fn_name);
++    let Some(pre_cond_fn_def_id) = tcx.get_diagnostic_item(pre_cond_fn_symbol) else { return };
++
++    // get post condition
++    let post_cond_fn_name = "ffi_sanitizer_ffi_post_cond";
++    let post_cond_fn_symbol = Symbol::intern(post_cond_fn_name);
++    let Some(post_cond_fn_def_id) = tcx.get_diagnostic_item(post_cond_fn_symbol) else { return };
++
++    let pre_cond_args = select_raw_ptr_args(tcx, body, &args);
++    let mut post_cond_args = Vec::new();
++
++    for (generic_arg, func_arg) in pre_cond_args.iter().cloned() {
++        post_cond_args.push((generic_arg, func_arg, false));
++    }
++    if let ty::RawPtr(pty, _) = destination.ty(&body.local_decls, tcx).ty.kind() {
++        post_cond_args.push((*pty, dummy_spanned(Operand::Copy(destination)), true));
++    }
++
++    if pre_cond_args.is_empty() && post_cond_args.is_empty() {
++        return;
++    }
++
++    let source_info = body[current].terminator().source_info;
++
++    // create basic blocks for pre condition function
++    let mut pre_cond_bb = Vec::new();
++    for (generic_arg, func_arg) in pre_cond_args.iter().cloned() {
++        let pre_cond_fn = Operand::function_handle(
++            tcx,
++            pre_cond_fn_def_id,
++            [generic_arg.into()],
++            source_info.span,
++        );
++
++        let terminator = Terminator {
++            source_info,
++            kind: TerminatorKind::Call {
++                func: pre_cond_fn,
++                args: [func_arg.into()].into(),
++                destination: get_temp_local(tcx, body),
++                target: Some(BasicBlock::ZERO),
++                unwind,
++                call_source,
++                fn_span,
++            },
++        };
++
++        let block = BasicBlockData::new(Some(terminator), false);
++        let bb = body.basic_blocks_mut().push(block);
++        pre_cond_bb.push(bb);
++    }
++
++    // create a basic block for the ffi call
++    let terminator = Terminator {
++        source_info,
++        kind: TerminatorKind::Call {
++            func: func.clone(),
++            args: args.clone(),
++            destination,
++            target: Some(BasicBlock::ZERO),
++            unwind,
++            call_source,
++            fn_span,
++        },
++    };
++    let ffi_call_bb = body.basic_blocks_mut().push(BasicBlockData::new(Some(terminator), false));
++
++    // create basic blocks for post condition function
++    let mut post_cond_bb = Vec::new();
++    for (generic_arg, func_arg, is_return_val) in post_cond_args.iter().cloned() {
++        let post_cond_fn = Operand::function_handle(
++            tcx,
++            post_cond_fn_def_id,
++            [generic_arg.into()],
++            source_info.span,
++        );
++
++        let const_false = Operand::const_from_scalar(
++            tcx,
++            tcx.types.bool,
++            Scalar::from_bool(is_return_val),
++            source_info.span,
++        );
++
++        let terminator = Terminator {
++            source_info,
++            kind: TerminatorKind::Call {
++                func: post_cond_fn,
++                args: [func_arg.into(), dummy_spanned(const_false)].into(),
++                destination: get_temp_local(tcx, body),
++                target: Some(BasicBlock::ZERO),
++                unwind,
++                call_source,
++                fn_span,
++            },
++        };
++
++        let block = BasicBlockData::new(Some(terminator), false);
++        let bb = body.basic_blocks_mut().push(block);
++        post_cond_bb.push(bb);
++    }
++
++    /*
++     * next we link the new created basic block
++     */
++
++    // set a terminator goto the first pre cond block
++    if let Some(terminator) = body[current].terminator.as_mut() {
++        *terminator = Terminator {
++            source_info,
++            kind: TerminatorKind::Goto { target: *pre_cond_bb.first().unwrap_or(&ffi_call_bb) },
++        };
++    }
++
++    for (idx, &pre_bb) in pre_cond_bb.iter().enumerate() {
++        let target = if let Some(val) = pre_cond_bb.get(idx + 1) { *val } else { ffi_call_bb };
++        body[pre_bb].terminator_mut().successors_mut(|bb| *bb = target);
++    }
++
++    let first_post_bb = post_cond_bb[0];
++    body[ffi_call_bb].terminator_mut().successors_mut(|bb| *bb = first_post_bb);
++
++    for (idx, &post_bb) in post_cond_bb.iter().enumerate() {
++        let target = if let Some(val) = post_cond_bb.get(idx + 1) { *val } else { target.unwrap() };
++        body[post_bb].terminator_mut().successors_mut(|bb| *bb = target);
++    }
++}
++
++fn instrument_drop<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, current: BasicBlock) {
++    let TerminatorKind::Drop { place, .. } = body[current].terminator().kind else {
++        return;
++    };
++
++    let pre_cond_fn_name = "ffi_sanitizer_drop_pre_cond";
++    let pre_cond_fn_symbol = Symbol::intern(pre_cond_fn_name);
++    let Some(pre_cond_fn_def_id) = tcx.get_diagnostic_item(pre_cond_fn_symbol) else { return };
++    let ty::RawPtr(generic_arg, _) = place.ty(&body.local_decls, tcx).ty.kind() else { return };
++
++    let block = BasicBlockData::new(Some(body[current].terminator().clone()), false);
++    let drop_bb = body.basic_blocks_mut().push(block);
++
++    let source_info = body[current].terminator().source_info;
++    let pre_cond_fn = Operand::function_handle(
++        tcx,
++        pre_cond_fn_def_id,
++        [generic_arg.clone().into()],
++        source_info.span,
++    );
++
++    let fn_arg = dummy_spanned(Operand::Copy(place));
++    body[current].terminator_mut().kind = TerminatorKind::Call {
++        func: pre_cond_fn,
++        args: [fn_arg].into(),
++        destination: get_temp_local(tcx, body),
++        target: Some(drop_bb),
++        unwind: UnwindAction::Continue,
++        call_source: CallSource::Normal,
++        fn_span: DUMMY_SP,
++    };
++}
++
++fn instrument_func_can_be_ffi_call<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
++    for current in START_BLOCK..body.basic_blocks.next_index() {
++        match body[current].terminator().kind {
++            TerminatorKind::Return { .. } => instrument_return(tcx, body, current),
++            _ => {}
++        }
++    }
++}
++
++fn instrument_main_func<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
++    let pre_cond_fn_name = "ffi_sanitizer_exit_pre_cond";
++    let pre_cond_fn_symbol = Symbol::intern(pre_cond_fn_name);
++    let Some(pre_cond_fn_def_id) = tcx.get_diagnostic_item(pre_cond_fn_symbol) else { return };
++
++    for current in START_BLOCK..body.basic_blocks.next_index() {
++        let TerminatorKind::Return {} = body[current].terminator().kind else {
++            continue;
++        };
++
++        let block = BasicBlockData::new(Some(body[current].terminator().clone()), false);
++        let ret_bb = body.basic_blocks_mut().push(block);
++
++        let source_info = body[current].terminator().source_info;
++        let pre_cond_fn = Operand::function_handle(tcx, pre_cond_fn_def_id, [], source_info.span);
++
++        body[current].terminator_mut().kind = TerminatorKind::Call {
++            func: pre_cond_fn,
++            args: [].into(),
++            destination: get_temp_local(tcx, body),
++            target: Some(ret_bb),
++            unwind: UnwindAction::Unreachable,
++            call_source: CallSource::Misc,
++            fn_span: DUMMY_SP,
++        };
++    }
++}
++
++struct DerefVisitor<'tcx> {
++    vars: Vec<Place<'tcx>>,
++}
++
++impl<'tcx> Visitor<'tcx> for DerefVisitor<'tcx> {
++    fn visit_place(&mut self, place: &Place<'tcx>, _: PlaceContext, _: Location) {
++        let Some(p) = place.projection.get(0) else { return };
++        if matches!(p, ProjectionElem::Deref) {
++            let base_place = mir::Place { local: place.local, projection: ty::List::empty() };
++
++            self.vars.push(base_place);
++        }
++    }
++}
+diff --git a/compiler/rustc_mir_transform/src/lib.rs b/compiler/rustc_mir_transform/src/lib.rs
+index 4625b20f..d408e7dd 100644
+--- a/compiler/rustc_mir_transform/src/lib.rs
++++ b/compiler/rustc_mir_transform/src/lib.rs
+@@ -144,6 +144,7 @@ mod dead_store_elimination : DeadStoreElimination {
+     mod elaborate_box_derefs : ElaborateBoxDerefs;
+     mod elaborate_drops : ElaborateDrops;
+     mod function_item_references : FunctionItemReferences;
++    mod ffi_sanitizer : FFISanitizer;
+     mod gvn : GVN;
+     // Made public so that `mir_drops_elaborated_and_const_checked` can be overridden
+     // by custom rustc drivers, running all the steps by themselves. See #114628.
+@@ -742,6 +743,7 @@ fn o1<T>(x: T) -> WithMinOptLevel<T> {
+             &simplify::SimplifyLocals::Final,
+             &multiple_return_terminators::MultipleReturnTerminators,
+             &large_enums::EnumSizeOpt { discrepancy: 128 },
++            &ffi_sanitizer::FFISanitizer,
+             // Some cleanup necessary at least for LLVM and potentially other codegen backends.
+             &add_call_guards::CriticalCallEdges,
+             // Cleanup for human readability, off by default.
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 38340f9b..95790477 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -1041,6 +1041,7 @@
+         fetch_update,
+         ffi,
+         ffi_const,
++        ffi_sanitizer,
+         ffi_pure,
+         ffi_returns_twice,
+         field,
+diff --git a/library/Cargo.lock b/library/Cargo.lock
+index 50fb060f..636a693d 100644
+--- a/library/Cargo.lock
++++ b/library/Cargo.lock
+@@ -67,6 +67,9 @@ dependencies = [
+ [[package]]
+ name = "core"
+ version = "0.0.0"
++dependencies = [
++ "cc",
++]
+ 
+ [[package]]
+ name = "coretests"
+diff --git a/library/core/Cargo.toml b/library/core/Cargo.toml
+index d094172b..05ba2b2a 100644
+--- a/library/core/Cargo.toml
++++ b/library/core/Cargo.toml
+@@ -39,3 +39,8 @@ check-cfg = [
+     'cfg(target_has_reliable_f128)',
+     'cfg(target_has_reliable_f128_math)',
+ ]
++
++[build-dependencies]
++# tidy-alphabetical-start
++# `cc` updates often break things, so we pin it here.
++cc = "=1.2.0"
+\ No newline at end of file
+diff --git a/library/core/build.rs b/library/core/build.rs
+new file mode 100644
+index 00000000..cbaf53ff
+--- /dev/null
++++ b/library/core/build.rs
+@@ -0,0 +1,12 @@
++fn main() {
++    println!("cargo:rerun-if-changed=src/libffisan/lib.c");
++    cc::Build::new()
++        .file("src/libffisan/lib.c")
++        .flag("-std=c11")
++        .flag("-fPIC")
++        .warnings(true)
++        .extra_warnings(true)
++        .debug(true)
++        .compile("ffisan");
++    println!("cargo:rustc-link-lib=static=ffisan");
++}
+diff --git a/library/core/src/ffi_sanitizer.rs b/library/core/src/ffi_sanitizer.rs
+new file mode 100644
+index 00000000..8c3075f2
+--- /dev/null
++++ b/library/core/src/ffi_sanitizer.rs
+@@ -0,0 +1,143 @@
++use crate::libffisan::{F_ALLOC_C, F_ALLOC_R, F_FREE_R, header};
++#[allow(missing_docs)]
++#[allow(unused_imports)]
++// use crate::alloc;
++// use crate::core::ptr;
++use crate::marker::PointeeSized;
++use crate::panic::Location;
++use crate::{ffi, libffisan};
++
++#[inline]
++unsafe fn ffi_sanitizer_header_ref<T: PointeeSized>(
++    pointer: *const T,
++) -> Option<&'static mut header> {
++    let raw = pointer as *mut ffi::c_void;
++    let header_ptr = unsafe { libffisan::__ffi_sanitizer_get_header(raw) };
++    if header_ptr.is_null() {
++        return None;
++    }
++
++    unsafe { Some(&mut *header_ptr) }
++}
++
++#[inline]
++unsafe fn ffi_sanitizer_put_alloc_list<T: PointeeSized>(pointer: *const T, loc: &Location<'_>) {
++    unsafe {
++        libffisan::__ffi_sanitizer_put_alloc_list(
++            pointer as *mut ffi::c_void,
++            loc.file().as_ptr() as *mut ffi::c_char,
++            loc.file().len() as ffi::c_uint,
++            loc.line() as ffi::c_uint,
++        );
++    }
++}
++
++#[track_caller]
++#[unstable(feature = "ffi_sanitizer", issue = "none")]
++#[rustc_diagnostic_item = "ffi_sanitizer_non_null"]
++pub unsafe fn ffi_sanitizer_non_null<T: PointeeSized>(pointer: *const T) {
++    if pointer.is_null() {
++        panic!("FFI Probe: pointer should non null");
++    }
++}
++
++#[track_caller]
++#[unstable(feature = "ffi_sanitizer", issue = "none")]
++#[rustc_diagnostic_item = "ffi_sanitizer_non_free"]
++pub unsafe fn ffi_sanitizer_non_free<T: PointeeSized>(pointer: *mut T) {
++    let raw = pointer as *mut ffi::c_void;
++    let metadata = unsafe { libffisan::__ffi_sanitizer_get_header(raw) };
++    if metadata.is_null() {
++        panic!("non free");
++    }
++}
++
++#[track_caller]
++#[unstable(feature = "ffi_sanitizer", issue = "none")]
++#[rustc_diagnostic_item = "ffi_sanitizer_ffi_pre_cond"]
++pub unsafe fn ffi_sanitizer_ffi_pre_cond<T: PointeeSized>(pointer: *const T) {
++    if pointer.is_null() {
++        return;
++    }
++    unsafe {
++        let Some(header) = ffi_sanitizer_header_ref(pointer) else { return };
++        if header.cps.f_free() != 0 {
++            panic!("FFI Probe: use-after-free, object {:?} is freed before ffi call", pointer);
++        }
++        ffi_sanitizer_put_alloc_list(pointer, Location::caller());
++    }
++}
++
++#[track_caller]
++#[unstable(feature = "ffi_sanitizer", issue = "none")]
++#[rustc_diagnostic_item = "ffi_sanitizer_ffi_post_cond"]
++pub unsafe fn ffi_sanitizer_ffi_post_cond<T: PointeeSized>(pointer: *const T, retval: bool) {
++    if pointer.is_null() {
++        return;
++    }
++
++    if retval {
++        unsafe {
++            let Some(header) = ffi_sanitizer_header_ref(pointer) else { return };
++
++            if header.cps.f_free() != 0 {
++                panic!("FFI Probe: use-after-free detected: the return value is not avaliable");
++            }
++            ffi_sanitizer_put_alloc_list(pointer, Location::caller());
++        }
++        return;
++    }
++
++    unsafe {
++        let Some(header) = ffi_sanitizer_header_ref(pointer) else { return };
++        // UB
++        if header.cps.f_free() != 0 && header.cps.f_free() != header.cps.f_alloc() {
++            let alloc_lang = if header.cps.f_alloc() == F_ALLOC_R { "rust" } else { "C" };
++            let free_lang = if header.cps.f_free() == F_FREE_R { "rust" } else { "C" };
++            panic!(
++                "FFI Probe: undefined behavior detected: object alloced in {} but freed in {}",
++                alloc_lang, free_lang
++            );
++        }
++
++        // out-of-bound
++        if libffisan::__ffi_sanitizer_check_red_zone(pointer as *mut ffi::c_void) != 0 {
++            panic!("FFI Probe: out-of-bound detected.");
++        }
++    }
++}
++
++#[track_caller]
++#[unstable(feature = "ffi_sanitizer", issue = "none")]
++#[rustc_diagnostic_item = "ffi_sanitizer_drop_pre_cond"]
++pub unsafe fn ffi_sanitizer_drop_pre_cond<T: PointeeSized>(pointer: *const T) {
++    unsafe {
++        let Some(header) = ffi_sanitizer_header_ref(pointer) else { return };
++        if header.cps.f_free() == F_ALLOC_R || header.cps.f_free() == F_ALLOC_C {
++            panic!("FFI Probe: double free detected");
++        }
++    }
++}
++
++#[track_caller]
++#[unstable(feature = "ffi_sanitizer", issue = "none")]
++#[rustc_diagnostic_item = "ffi_sanitizer_use_pre_cond"]
++pub unsafe fn ffi_sanitizer_use_pre_cond<T: PointeeSized>(pointer: *const T) {
++    unsafe {
++        let Some(header) = ffi_sanitizer_header_ref(pointer) else { return };
++        if header.cps.f_free() == F_ALLOC_R || header.cps.f_free() == F_ALLOC_C {
++            panic!("FFI Probe: use-after-free detected, addr {:?}", pointer);
++        }
++    }
++}
++
++#[track_caller]
++#[unstable(feature = "ffi_sanitizer", issue = "none")]
++#[rustc_diagnostic_item = "ffi_sanitizer_exit_pre_cond"]
++pub unsafe fn ffi_sanitizer_exit_pre_cond() {
++    let ret = unsafe { libffisan::__ffi_sanitizer_print_leak_summary() };
++    if ret != 0 {
++        panic!("FFI Probe: memory leak detected");
++    }
++}
++
+diff --git a/library/core/src/lib.rs b/library/core/src/lib.rs
+index bc428c37..8ca5f347 100644
+--- a/library/core/src/lib.rs
++++ b/library/core/src/lib.rs
+@@ -309,6 +309,12 @@ pub mod autodiff {
+ pub mod cell;
+ pub mod char;
+ pub mod ffi;
++#[allow(missing_docs)]
++#[unstable(feature = "ffi_sanitizer", issue = "none")]
++pub mod ffi_sanitizer;
++#[allow(missing_docs)]
++#[unstable(feature = "libffisan", issue = "none")]
++pub mod libffisan;
+ #[unstable(feature = "core_io_borrowed_buf", issue = "117693")]
+ pub mod io;
+ pub mod iter;
+diff --git a/library/core/src/libffisan/bindings.rs b/library/core/src/libffisan/bindings.rs
+new file mode 100644
+index 00000000..c6f0d913
+--- /dev/null
++++ b/library/core/src/libffisan/bindings.rs
+@@ -0,0 +1,596 @@
++/* automatically generated by rust-bindgen 0.72.1 */
++
++#[repr(C)]
++#[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
++pub struct __BindgenBitfieldUnit<Storage> {
++    storage: Storage,
++}
++impl<Storage> __BindgenBitfieldUnit<Storage> {
++    #[inline]
++    pub const fn new(storage: Storage) -> Self {
++        Self { storage }
++    }
++}
++impl<Storage> __BindgenBitfieldUnit<Storage>
++where
++    Storage: AsRef<[u8]> + AsMut<[u8]>,
++{
++    #[inline]
++    fn extract_bit(byte: u8, index: usize) -> bool {
++        let bit_index = if cfg!(target_endian = "big") { 7 - (index % 8) } else { index % 8 };
++        let mask = 1 << bit_index;
++        byte & mask == mask
++    }
++    #[inline]
++    pub fn get_bit(&self, index: usize) -> bool {
++        debug_assert!(index / 8 < self.storage.as_ref().len());
++        let byte_index = index / 8;
++        let byte = self.storage.as_ref()[byte_index];
++        Self::extract_bit(byte, index)
++    }
++    #[inline]
++    pub unsafe fn raw_get_bit(this: *const Self, index: usize) -> bool {
++        debug_assert!(index / 8 < core::mem::size_of::<Storage>());
++        let byte_index = index / 8;
++        let byte = unsafe {
++            *(core::ptr::addr_of!((*this).storage) as *const u8).offset(byte_index as isize)
++        };
++        Self::extract_bit(byte, index)
++    }
++    #[inline]
++    fn change_bit(byte: u8, index: usize, val: bool) -> u8 {
++        let bit_index = if cfg!(target_endian = "big") { 7 - (index % 8) } else { index % 8 };
++        let mask = 1 << bit_index;
++        if val { byte | mask } else { byte & !mask }
++    }
++    #[inline]
++    pub fn set_bit(&mut self, index: usize, val: bool) {
++        debug_assert!(index / 8 < self.storage.as_ref().len());
++        let byte_index = index / 8;
++        let byte = &mut self.storage.as_mut()[byte_index];
++        *byte = Self::change_bit(*byte, index, val);
++    }
++    #[inline]
++    pub unsafe fn raw_set_bit(this: *mut Self, index: usize, val: bool) {
++        debug_assert!(index / 8 < core::mem::size_of::<Storage>());
++        let byte_index = index / 8;
++        let byte = unsafe {
++            (core::ptr::addr_of_mut!((*this).storage) as *mut u8).offset(byte_index as isize)
++        };
++        unsafe { *byte = Self::change_bit(*byte, index, val) };
++    }
++    #[inline]
++    pub fn get(&self, bit_offset: usize, bit_width: u8) -> u64 {
++        debug_assert!(bit_width <= 64);
++        debug_assert!(bit_offset / 8 < self.storage.as_ref().len());
++        debug_assert!((bit_offset + (bit_width as usize)) / 8 <= self.storage.as_ref().len());
++        let mut val = 0;
++        for i in 0..(bit_width as usize) {
++            if self.get_bit(i + bit_offset) {
++                let index =
++                    if cfg!(target_endian = "big") { bit_width as usize - 1 - i } else { i };
++                val |= 1 << index;
++            }
++        }
++        val
++    }
++    #[inline]
++    pub unsafe fn raw_get(this: *const Self, bit_offset: usize, bit_width: u8) -> u64 {
++        debug_assert!(bit_width <= 64);
++        debug_assert!(bit_offset / 8 < core::mem::size_of::<Storage>());
++        debug_assert!((bit_offset + (bit_width as usize)) / 8 <= core::mem::size_of::<Storage>());
++        let mut val = 0;
++        for i in 0..(bit_width as usize) {
++            if unsafe { Self::raw_get_bit(this, i + bit_offset) } {
++                let index =
++                    if cfg!(target_endian = "big") { bit_width as usize - 1 - i } else { i };
++                val |= 1 << index;
++            }
++        }
++        val
++    }
++    #[inline]
++    pub fn set(&mut self, bit_offset: usize, bit_width: u8, val: u64) {
++        debug_assert!(bit_width <= 64);
++        debug_assert!(bit_offset / 8 < self.storage.as_ref().len());
++        debug_assert!((bit_offset + (bit_width as usize)) / 8 <= self.storage.as_ref().len());
++        for i in 0..(bit_width as usize) {
++            let mask = 1 << i;
++            let val_bit_is_set = val & mask == mask;
++            let index = if cfg!(target_endian = "big") { bit_width as usize - 1 - i } else { i };
++            self.set_bit(index + bit_offset, val_bit_is_set);
++        }
++    }
++    #[inline]
++    pub unsafe fn raw_set(this: *mut Self, bit_offset: usize, bit_width: u8, val: u64) {
++        debug_assert!(bit_width <= 64);
++        debug_assert!(bit_offset / 8 < core::mem::size_of::<Storage>());
++        debug_assert!((bit_offset + (bit_width as usize)) / 8 <= core::mem::size_of::<Storage>());
++        for i in 0..(bit_width as usize) {
++            let mask = 1 << i;
++            let val_bit_is_set = val & mask == mask;
++            let index = if cfg!(target_endian = "big") { bit_width as usize - 1 - i } else { i };
++            unsafe { Self::raw_set_bit(this, index + bit_offset, val_bit_is_set) };
++        }
++    }
++}
++pub const _STDINT_H: u32 = 1;
++pub const _FEATURES_H: u32 = 1;
++pub const _DEFAULT_SOURCE: u32 = 1;
++pub const __GLIBC_USE_ISOC2Y: u32 = 0;
++pub const __GLIBC_USE_ISOC23: u32 = 0;
++pub const __USE_ISOC11: u32 = 1;
++pub const __USE_ISOC99: u32 = 1;
++pub const __USE_ISOC95: u32 = 1;
++pub const __USE_POSIX_IMPLICITLY: u32 = 1;
++pub const _POSIX_SOURCE: u32 = 1;
++pub const _POSIX_C_SOURCE: u32 = 200809;
++pub const __USE_POSIX: u32 = 1;
++pub const __USE_POSIX2: u32 = 1;
++pub const __USE_POSIX199309: u32 = 1;
++pub const __USE_POSIX199506: u32 = 1;
++pub const __USE_XOPEN2K: u32 = 1;
++pub const __USE_XOPEN2K8: u32 = 1;
++pub const _ATFILE_SOURCE: u32 = 1;
++pub const __WORDSIZE: u32 = 64;
++pub const __WORDSIZE_TIME64_COMPAT32: u32 = 1;
++pub const __SYSCALL_WORDSIZE: u32 = 64;
++pub const __TIMESIZE: u32 = 64;
++pub const __USE_TIME_BITS64: u32 = 1;
++pub const __USE_MISC: u32 = 1;
++pub const __USE_ATFILE: u32 = 1;
++pub const __USE_FORTIFY_LEVEL: u32 = 0;
++pub const __GLIBC_USE_DEPRECATED_GETS: u32 = 0;
++pub const __GLIBC_USE_DEPRECATED_SCANF: u32 = 0;
++pub const __GLIBC_USE_C23_STRTOL: u32 = 0;
++pub const _STDC_PREDEF_H: u32 = 1;
++pub const __STDC_IEC_559__: u32 = 1;
++pub const __STDC_IEC_60559_BFP__: u32 = 201404;
++pub const __STDC_IEC_559_COMPLEX__: u32 = 1;
++pub const __STDC_IEC_60559_COMPLEX__: u32 = 201404;
++pub const __STDC_ISO_10646__: u32 = 201706;
++pub const __GNU_LIBRARY__: u32 = 6;
++pub const __GLIBC__: u32 = 2;
++pub const __GLIBC_MINOR__: u32 = 41;
++pub const _SYS_CDEFS_H: u32 = 1;
++pub const __glibc_c99_flexarr_available: u32 = 1;
++pub const __LDOUBLE_REDIRECTS_TO_FLOAT128_ABI: u32 = 0;
++pub const __HAVE_GENERIC_SELECTION: u32 = 1;
++pub const __GLIBC_USE_LIB_EXT2: u32 = 0;
++pub const __GLIBC_USE_IEC_60559_BFP_EXT: u32 = 0;
++pub const __GLIBC_USE_IEC_60559_BFP_EXT_C23: u32 = 0;
++pub const __GLIBC_USE_IEC_60559_EXT: u32 = 0;
++pub const __GLIBC_USE_IEC_60559_FUNCS_EXT: u32 = 0;
++pub const __GLIBC_USE_IEC_60559_FUNCS_EXT_C23: u32 = 0;
++pub const __GLIBC_USE_IEC_60559_TYPES_EXT: u32 = 0;
++pub const _BITS_TYPES_H: u32 = 1;
++pub const _BITS_TYPESIZES_H: u32 = 1;
++pub const __OFF_T_MATCHES_OFF64_T: u32 = 1;
++pub const __INO_T_MATCHES_INO64_T: u32 = 1;
++pub const __RLIM_T_MATCHES_RLIM64_T: u32 = 1;
++pub const __STATFS_MATCHES_STATFS64: u32 = 1;
++pub const __KERNEL_OLD_TIMEVAL_MATCHES_TIMEVAL64: u32 = 1;
++pub const __FD_SETSIZE: u32 = 1024;
++pub const _BITS_TIME64_H: u32 = 1;
++pub const _BITS_WCHAR_H: u32 = 1;
++pub const _BITS_STDINT_INTN_H: u32 = 1;
++pub const _BITS_STDINT_UINTN_H: u32 = 1;
++pub const _BITS_STDINT_LEAST_H: u32 = 1;
++pub const INT8_MIN: i32 = -128;
++pub const INT16_MIN: i32 = -32768;
++pub const INT32_MIN: i32 = -2147483648;
++pub const INT8_MAX: u32 = 127;
++pub const INT16_MAX: u32 = 32767;
++pub const INT32_MAX: u32 = 2147483647;
++pub const UINT8_MAX: u32 = 255;
++pub const UINT16_MAX: u32 = 65535;
++pub const UINT32_MAX: u32 = 4294967295;
++pub const INT_LEAST8_MIN: i32 = -128;
++pub const INT_LEAST16_MIN: i32 = -32768;
++pub const INT_LEAST32_MIN: i32 = -2147483648;
++pub const INT_LEAST8_MAX: u32 = 127;
++pub const INT_LEAST16_MAX: u32 = 32767;
++pub const INT_LEAST32_MAX: u32 = 2147483647;
++pub const UINT_LEAST8_MAX: u32 = 255;
++pub const UINT_LEAST16_MAX: u32 = 65535;
++pub const UINT_LEAST32_MAX: u32 = 4294967295;
++pub const INT_FAST8_MIN: i32 = -128;
++pub const INT_FAST16_MIN: i64 = -9223372036854775808;
++pub const INT_FAST32_MIN: i64 = -9223372036854775808;
++pub const INT_FAST8_MAX: u32 = 127;
++pub const INT_FAST16_MAX: u64 = 9223372036854775807;
++pub const INT_FAST32_MAX: u64 = 9223372036854775807;
++pub const UINT_FAST8_MAX: u32 = 255;
++pub const UINT_FAST16_MAX: i32 = -1;
++pub const UINT_FAST32_MAX: i32 = -1;
++pub const INTPTR_MIN: i64 = -9223372036854775808;
++pub const INTPTR_MAX: u64 = 9223372036854775807;
++pub const UINTPTR_MAX: i32 = -1;
++pub const PTRDIFF_MIN: i64 = -9223372036854775808;
++pub const PTRDIFF_MAX: u64 = 9223372036854775807;
++pub const SIG_ATOMIC_MIN: i32 = -2147483648;
++pub const SIG_ATOMIC_MAX: u32 = 2147483647;
++pub const SIZE_MAX: i32 = -1;
++pub const WINT_MIN: u32 = 0;
++pub const WINT_MAX: u32 = 4294967295;
++pub const RED_ZONE_SIZE: u32 = 16;
++pub const RED_ZONE_PATTERN: u32 = 3735928559;
++pub const HEADER_MAGIC: u32 = 2748;
++pub const DEFAULT_ALIGN: u32 = 16;
++pub const F_ALLOC_R: u32 = 1;
++pub const F_ALLOC_C: u32 = 2;
++pub const F_FREE_R: u32 = 1;
++pub const F_FREE_C: u32 = 2;
++pub const F_OWNED: u32 = 1;
++pub type wchar_t = ::core::ffi::c_int;
++#[repr(C)]
++#[repr(align(16))]
++#[derive(Debug, Copy, Clone)]
++pub struct max_align_t {
++    pub __clang_max_align_nonce1: ::core::ffi::c_longlong,
++    pub __bindgen_padding_0: u64,
++    pub __clang_max_align_nonce2: u128,
++}
++#[allow(clippy::unnecessary_operation, clippy::identity_op)]
++const _: () = {
++    ["Size of max_align_t"][::core::mem::size_of::<max_align_t>() - 32usize];
++    ["Alignment of max_align_t"][::core::mem::align_of::<max_align_t>() - 16usize];
++    ["Offset of field: max_align_t::__clang_max_align_nonce1"]
++        [::core::mem::offset_of!(max_align_t, __clang_max_align_nonce1) - 0usize];
++    ["Offset of field: max_align_t::__clang_max_align_nonce2"]
++        [::core::mem::offset_of!(max_align_t, __clang_max_align_nonce2) - 16usize];
++};
++pub type __u_char = ::core::ffi::c_uchar;
++pub type __u_short = ::core::ffi::c_ushort;
++pub type __u_int = ::core::ffi::c_uint;
++pub type __u_long = ::core::ffi::c_ulong;
++pub type __int8_t = ::core::ffi::c_schar;
++pub type __uint8_t = ::core::ffi::c_uchar;
++pub type __int16_t = ::core::ffi::c_short;
++pub type __uint16_t = ::core::ffi::c_ushort;
++pub type __int32_t = ::core::ffi::c_int;
++pub type __uint32_t = ::core::ffi::c_uint;
++pub type __int64_t = ::core::ffi::c_long;
++pub type __uint64_t = ::core::ffi::c_ulong;
++pub type __int_least8_t = __int8_t;
++pub type __uint_least8_t = __uint8_t;
++pub type __int_least16_t = __int16_t;
++pub type __uint_least16_t = __uint16_t;
++pub type __int_least32_t = __int32_t;
++pub type __uint_least32_t = __uint32_t;
++pub type __int_least64_t = __int64_t;
++pub type __uint_least64_t = __uint64_t;
++pub type __quad_t = ::core::ffi::c_long;
++pub type __u_quad_t = ::core::ffi::c_ulong;
++pub type __intmax_t = ::core::ffi::c_long;
++pub type __uintmax_t = ::core::ffi::c_ulong;
++pub type __dev_t = ::core::ffi::c_ulong;
++pub type __uid_t = ::core::ffi::c_uint;
++pub type __gid_t = ::core::ffi::c_uint;
++pub type __ino_t = ::core::ffi::c_ulong;
++pub type __ino64_t = ::core::ffi::c_ulong;
++pub type __mode_t = ::core::ffi::c_uint;
++pub type __nlink_t = ::core::ffi::c_ulong;
++pub type __off_t = ::core::ffi::c_long;
++pub type __off64_t = ::core::ffi::c_long;
++pub type __pid_t = ::core::ffi::c_int;
++#[repr(C)]
++#[derive(Debug, Copy, Clone)]
++pub struct __fsid_t {
++    pub __val: [::core::ffi::c_int; 2usize],
++}
++#[allow(clippy::unnecessary_operation, clippy::identity_op)]
++const _: () = {
++    ["Size of __fsid_t"][::core::mem::size_of::<__fsid_t>() - 8usize];
++    ["Alignment of __fsid_t"][::core::mem::align_of::<__fsid_t>() - 4usize];
++    ["Offset of field: __fsid_t::__val"][::core::mem::offset_of!(__fsid_t, __val) - 0usize];
++};
++pub type __clock_t = ::core::ffi::c_long;
++pub type __rlim_t = ::core::ffi::c_ulong;
++pub type __rlim64_t = ::core::ffi::c_ulong;
++pub type __id_t = ::core::ffi::c_uint;
++pub type __time_t = ::core::ffi::c_long;
++pub type __useconds_t = ::core::ffi::c_uint;
++pub type __suseconds_t = ::core::ffi::c_long;
++pub type __suseconds64_t = ::core::ffi::c_long;
++pub type __daddr_t = ::core::ffi::c_int;
++pub type __key_t = ::core::ffi::c_int;
++pub type __clockid_t = ::core::ffi::c_int;
++pub type __timer_t = *mut ::core::ffi::c_void;
++pub type __blksize_t = ::core::ffi::c_long;
++pub type __blkcnt_t = ::core::ffi::c_long;
++pub type __blkcnt64_t = ::core::ffi::c_long;
++pub type __fsblkcnt_t = ::core::ffi::c_ulong;
++pub type __fsblkcnt64_t = ::core::ffi::c_ulong;
++pub type __fsfilcnt_t = ::core::ffi::c_ulong;
++pub type __fsfilcnt64_t = ::core::ffi::c_ulong;
++pub type __fsword_t = ::core::ffi::c_long;
++pub type __ssize_t = ::core::ffi::c_long;
++pub type __syscall_slong_t = ::core::ffi::c_long;
++pub type __syscall_ulong_t = ::core::ffi::c_ulong;
++pub type __loff_t = __off64_t;
++pub type __caddr_t = *mut ::core::ffi::c_char;
++pub type __intptr_t = ::core::ffi::c_long;
++pub type __socklen_t = ::core::ffi::c_uint;
++pub type __sig_atomic_t = ::core::ffi::c_int;
++pub type int_least8_t = __int_least8_t;
++pub type int_least16_t = __int_least16_t;
++pub type int_least32_t = __int_least32_t;
++pub type int_least64_t = __int_least64_t;
++pub type uint_least8_t = __uint_least8_t;
++pub type uint_least16_t = __uint_least16_t;
++pub type uint_least32_t = __uint_least32_t;
++pub type uint_least64_t = __uint_least64_t;
++pub type int_fast8_t = ::core::ffi::c_schar;
++pub type int_fast16_t = ::core::ffi::c_long;
++pub type int_fast32_t = ::core::ffi::c_long;
++pub type int_fast64_t = ::core::ffi::c_long;
++pub type uint_fast8_t = ::core::ffi::c_uchar;
++pub type uint_fast16_t = ::core::ffi::c_ulong;
++pub type uint_fast32_t = ::core::ffi::c_ulong;
++pub type uint_fast64_t = ::core::ffi::c_ulong;
++pub type intmax_t = __intmax_t;
++pub type uintmax_t = __uintmax_t;
++#[repr(C)]
++#[derive(Debug, Copy, Clone)]
++pub struct header {
++    pub data_size: ::core::ffi::c_uint,
++    pub offset: ::core::ffi::c_uint,
++    pub cps: header__bindgen_ty_1,
++}
++#[repr(C)]
++#[derive(Debug, Copy, Clone)]
++pub struct header__bindgen_ty_1 {
++    pub _bitfield_align_1: [u64; 0],
++    pub _bitfield_1: __BindgenBitfieldUnit<[u8; 8usize]>,
++}
++#[allow(clippy::unnecessary_operation, clippy::identity_op)]
++const _: () = {
++    ["Size of header__bindgen_ty_1"][::core::mem::size_of::<header__bindgen_ty_1>() - 8usize];
++    ["Alignment of header__bindgen_ty_1"][::core::mem::align_of::<header__bindgen_ty_1>() - 8usize];
++};
++impl header__bindgen_ty_1 {
++    #[inline]
++    pub fn alloc_list(&self) -> usize {
++        unsafe { ::core::mem::transmute(self._bitfield_1.get(0usize, 48u8) as u64) }
++    }
++    #[inline]
++    pub fn set_alloc_list(&mut self, val: usize) {
++        unsafe {
++            let val: u64 = ::core::mem::transmute(val);
++            self._bitfield_1.set(0usize, 48u8, val as u64)
++        }
++    }
++    #[inline]
++    pub unsafe fn alloc_list_raw(this: *const Self) -> usize {
++        unsafe {
++            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 8usize]>>::raw_get(
++                ::core::ptr::addr_of!((*this)._bitfield_1),
++                0usize,
++                48u8,
++            ) as u64)
++        }
++    }
++    #[inline]
++    pub unsafe fn set_alloc_list_raw(this: *mut Self, val: usize) {
++        unsafe {
++            let val: u64 = ::core::mem::transmute(val);
++            <__BindgenBitfieldUnit<[u8; 8usize]>>::raw_set(
++                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
++                0usize,
++                48u8,
++                val as u64,
++            )
++        }
++    }
++    #[inline]
++    pub fn magic(&self) -> ::core::ffi::c_uint {
++        unsafe { ::core::mem::transmute(self._bitfield_1.get(48usize, 12u8) as u32) }
++    }
++    #[inline]
++    pub fn set_magic(&mut self, val: ::core::ffi::c_uint) {
++        unsafe {
++            let val: u32 = ::core::mem::transmute(val);
++            self._bitfield_1.set(48usize, 12u8, val as u64)
++        }
++    }
++    #[inline]
++    pub unsafe fn magic_raw(this: *const Self) -> ::core::ffi::c_uint {
++        unsafe {
++            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 8usize]>>::raw_get(
++                ::core::ptr::addr_of!((*this)._bitfield_1),
++                48usize,
++                12u8,
++            ) as u32)
++        }
++    }
++    #[inline]
++    pub unsafe fn set_magic_raw(this: *mut Self, val: ::core::ffi::c_uint) {
++        unsafe {
++            let val: u32 = ::core::mem::transmute(val);
++            <__BindgenBitfieldUnit<[u8; 8usize]>>::raw_set(
++                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
++                48usize,
++                12u8,
++                val as u64,
++            )
++        }
++    }
++    #[inline]
++    pub fn f_alloc(&self) -> ::core::ffi::c_uint {
++        unsafe { ::core::mem::transmute(self._bitfield_1.get(60usize, 2u8) as u32) }
++    }
++    #[inline]
++    pub fn set_f_alloc(&mut self, val: ::core::ffi::c_uint) {
++        unsafe {
++            let val: u32 = ::core::mem::transmute(val);
++            self._bitfield_1.set(60usize, 2u8, val as u64)
++        }
++    }
++    #[inline]
++    pub unsafe fn f_alloc_raw(this: *const Self) -> ::core::ffi::c_uint {
++        unsafe {
++            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 8usize]>>::raw_get(
++                ::core::ptr::addr_of!((*this)._bitfield_1),
++                60usize,
++                2u8,
++            ) as u32)
++        }
++    }
++    #[inline]
++    pub unsafe fn set_f_alloc_raw(this: *mut Self, val: ::core::ffi::c_uint) {
++        unsafe {
++            let val: u32 = ::core::mem::transmute(val);
++            <__BindgenBitfieldUnit<[u8; 8usize]>>::raw_set(
++                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
++                60usize,
++                2u8,
++                val as u64,
++            )
++        }
++    }
++    #[inline]
++    pub fn f_free(&self) -> ::core::ffi::c_uint {
++        unsafe { ::core::mem::transmute(self._bitfield_1.get(62usize, 2u8) as u32) }
++    }
++    #[inline]
++    pub fn set_f_free(&mut self, val: ::core::ffi::c_uint) {
++        unsafe {
++            let val: u32 = ::core::mem::transmute(val);
++            self._bitfield_1.set(62usize, 2u8, val as u64)
++        }
++    }
++    #[inline]
++    pub unsafe fn f_free_raw(this: *const Self) -> ::core::ffi::c_uint {
++        unsafe {
++            ::core::mem::transmute(<__BindgenBitfieldUnit<[u8; 8usize]>>::raw_get(
++                ::core::ptr::addr_of!((*this)._bitfield_1),
++                62usize,
++                2u8,
++            ) as u32)
++        }
++    }
++    #[inline]
++    pub unsafe fn set_f_free_raw(this: *mut Self, val: ::core::ffi::c_uint) {
++        unsafe {
++            let val: u32 = ::core::mem::transmute(val);
++            <__BindgenBitfieldUnit<[u8; 8usize]>>::raw_set(
++                ::core::ptr::addr_of_mut!((*this)._bitfield_1),
++                62usize,
++                2u8,
++                val as u64,
++            )
++        }
++    }
++    #[inline]
++    pub fn new_bitfield_1(
++        alloc_list: usize,
++        magic: ::core::ffi::c_uint,
++        f_alloc: ::core::ffi::c_uint,
++        f_free: ::core::ffi::c_uint,
++    ) -> __BindgenBitfieldUnit<[u8; 8usize]> {
++        let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 8usize]> = Default::default();
++        __bindgen_bitfield_unit.set(0usize, 48u8, {
++            let alloc_list: u64 = unsafe { ::core::mem::transmute(alloc_list) };
++            alloc_list as u64
++        });
++        __bindgen_bitfield_unit.set(48usize, 12u8, {
++            let magic: u32 = unsafe { ::core::mem::transmute(magic) };
++            magic as u64
++        });
++        __bindgen_bitfield_unit.set(60usize, 2u8, {
++            let f_alloc: u32 = unsafe { ::core::mem::transmute(f_alloc) };
++            f_alloc as u64
++        });
++        __bindgen_bitfield_unit.set(62usize, 2u8, {
++            let f_free: u32 = unsafe { ::core::mem::transmute(f_free) };
++            f_free as u64
++        });
++        __bindgen_bitfield_unit
++    }
++}
++#[allow(clippy::unnecessary_operation, clippy::identity_op)]
++const _: () = {
++    ["Size of header"][::core::mem::size_of::<header>() - 16usize];
++    ["Alignment of header"][::core::mem::align_of::<header>() - 8usize];
++    ["Offset of field: header::data_size"][::core::mem::offset_of!(header, data_size) - 0usize];
++    ["Offset of field: header::offset"][::core::mem::offset_of!(header, offset) - 4usize];
++    ["Offset of field: header::cps"][::core::mem::offset_of!(header, cps) - 8usize];
++};
++pub type header_t = header;
++unsafe extern "C" {
++    pub fn malloc(size: ::core::ffi::c_ulong) -> *mut ::core::ffi::c_void;
++}
++unsafe extern "C" {
++    pub fn free(ptr: *mut ::core::ffi::c_void);
++}
++unsafe extern "C" {
++    pub fn realloc(
++        ptr: *mut ::core::ffi::c_void,
++        size: ::core::ffi::c_ulong,
++    ) -> *mut ::core::ffi::c_void;
++}
++unsafe extern "C" {
++    pub fn calloc(
++        nitems: ::core::ffi::c_ulong,
++        size: ::core::ffi::c_ulong,
++    ) -> *mut ::core::ffi::c_void;
++}
++unsafe extern "C" {
++    pub fn posix_memalign(
++        memptr: *mut *mut ::core::ffi::c_void,
++        alignment: usize,
++        size: usize,
++    ) -> ::core::ffi::c_int;
++}
++unsafe extern "C" {
++    pub fn aligned_alloc(
++        alignment: ::core::ffi::c_ulong,
++        size: ::core::ffi::c_ulong,
++    ) -> *mut ::core::ffi::c_void;
++}
++unsafe extern "C" {
++    pub fn memalign(
++        alignment: ::core::ffi::c_ulong,
++        size: ::core::ffi::c_ulong,
++    ) -> *mut ::core::ffi::c_void;
++}
++unsafe extern "C" {
++    pub fn __ffi_sanitizer_rust_alloc(size: usize) -> *mut ::core::ffi::c_void;
++}
++unsafe extern "C" {
++    pub fn __ffi_sanitizer_rust_free(ptr: *mut ::core::ffi::c_void);
++}
++unsafe extern "C" {
++    pub fn __ffi_sanitizer_rust_realloc(
++        ptr: *mut ::core::ffi::c_void,
++        size: usize,
++    ) -> *mut ::core::ffi::c_void;
++}
++unsafe extern "C" {
++    pub fn __ffi_sanitizer_rust_calloc(nitems: usize, size: usize) -> *mut ::core::ffi::c_void;
++}
++unsafe extern "C" {
++    pub fn __ffi_sanitizer_rust_posix_memalign(
++        memptr: *mut *mut ::core::ffi::c_void,
++        alignment: usize,
++        size: usize,
++    ) -> ::core::ffi::c_int;
++}
++unsafe extern "C" {
++    pub fn __ffi_sanitizer_get_header(ptr: *mut ::core::ffi::c_void) -> *mut header_t;
++}
++unsafe extern "C" {
++    pub fn __ffi_sanitizer_check_red_zone(ptr: *mut ::core::ffi::c_void) -> ::core::ffi::c_int;
++}
++unsafe extern "C" {
++    pub fn __ffi_sanitizer_print_leak_summary() -> ::core::ffi::c_int;
++}
++unsafe extern "C" {
++    pub fn __ffi_sanitizer_put_alloc_list(
++        data: *mut ::core::ffi::c_void,
++        file: *mut ::core::ffi::c_char,
++        len: ::core::ffi::c_uint,
++        line: ::core::ffi::c_uint,
++    );
++}
+diff --git a/library/core/src/libffisan/ffisan.h b/library/core/src/libffisan/ffisan.h
+new file mode 100644
+index 00000000..832fd940
+--- /dev/null
++++ b/library/core/src/libffisan/ffisan.h
+@@ -0,0 +1,82 @@
++#ifndef __FFISAN_H__
++#define __FFISAN_H__
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define RED_ZONE_SIZE 16
++#define RED_ZONE_PATTERN 0xDEADBEEF
++#define HEADER_MAGIC 0x999
++
++#define DEFAULT_ALIGN 16
++
++#define F_ALLOC_R 0b01
++#define F_ALLOC_C 0b10
++#define F_FREE_R 0b01
++#define F_FREE_C 0b10
++#define F_OWNED 0b1
++
++typedef struct header {
++  unsigned int data_size;
++  unsigned int offset;
++  struct {
++    uintptr_t alloc_list : 48;
++    unsigned magic : 12;
++    unsigned f_alloc : 2;
++    unsigned f_free : 2;
++  } cps;
++} header_t;
++
++// for c/c++ program
++void *malloc(size_t size);
++void free(void *ptr);
++void *realloc(void *ptr, size_t size);
++void *calloc(size_t nitems, size_t size);
++int posix_memalign(void **memptr, size_t alignment, size_t size);
++void *aligned_alloc(size_t alignment, size_t size);
++void *memalign(size_t alignment, size_t size);
++
++// for rust allocator
++void *__ffi_sanitizer_rust_alloc(size_t size);
++void __ffi_sanitizer_rust_free(void *ptr);
++void *__ffi_sanitizer_rust_realloc(void *ptr, size_t size);
++void *__ffi_sanitizer_rust_calloc(size_t nitems, size_t size);
++int __ffi_sanitizer_rust_posix_memalign(void **memptr, size_t alignment,
++                                        size_t size);
++
++header_t *__ffi_sanitizer_get_header(void *ptr);
++int __ffi_sanitizer_check_red_zone(void *ptr);
++int __ffi_sanitizer_print_leak_summary();
++void __ffi_sanitizer_put_alloc_list(void *data, char *file, unsigned len, unsigned line);
++
++#ifdef __FFISAN_INNER__
++// the following define is only available in ffisan library, and
++// not expose to rust bindings
++#include <pthread.h>
++
++#define RING_SIZE 1024
++
++typedef struct free_ring {
++  void *ring[RING_SIZE];
++  size_t head;
++  size_t tail;
++  pthread_mutex_t mutex;
++} free_ring_t;
++
++typedef struct list_node {
++  struct list_node *prev;
++  struct list_node *next;
++  char *last_file;
++  unsigned len;
++  unsigned last_line;
++  void *self;
++} list_node_t;
++
++typedef struct list_head {
++  list_node_t head;
++  pthread_mutex_t mutex;
++} list_head_t;
++
++#endif
++
++#endif
+\ No newline at end of file
+diff --git a/library/core/src/libffisan/lib.c b/library/core/src/libffisan/lib.c
+new file mode 100644
+index 00000000..82b6c876
+--- /dev/null
++++ b/library/core/src/libffisan/lib.c
+@@ -0,0 +1,496 @@
++#define _GNU_SOURCE
++#define __FFISAN_INNER__
++#include "ffisan.h"
++#include <assert.h>
++#include <dlfcn.h>
++#include <errno.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static pthread_once_t init_once = PTHREAD_ONCE_INIT;
++static void *(*libc_malloc)(size_t) = NULL;
++static void (*libc_free)(void *) = NULL;
++static void *(*libc_realloc)(void *, size_t) = NULL;
++
++// #define DEBUG
++#ifdef DEBUG
++#include <stdatomic.h>
++
++static atomic_int c_alloc_count = 0, c_free_count = 0;
++static atomic_int r_alloc_count = 0, r_free_count = 0;
++
++int safe_log(const char *restrict format, ...) {
++  char buffer[256];
++  va_list args;
++
++  va_start(args, format);
++  int len = vsnprintf(buffer, sizeof(buffer), format, args);
++  va_end(args);
++
++  fprintf(stderr, "%s", buffer);
++  fflush(stderr);
++  return len;
++}
++
++#else
++
++#define safe_log(...)
++#define atomic_fetch_add(...)
++
++#endif
++
++/**************************  alloc list definition ****************************/
++
++static list_head_t alloc_list;
++
++static inline void list_node_init(list_node_t *node) {
++  node->self = NULL;
++  node->prev = node;
++  node->next = node;
++}
++
++static list_node_t *list_new_node(void *self, char *file, unsigned len,
++                                  unsigned line) {
++  list_node_t *node;
++
++  node = (list_node_t *)libc_malloc(sizeof(list_node_t));
++  list_node_init(node);
++  node->self = self;
++  node->last_file = file;
++  node->len = len;
++  node->last_line = line;
++  return node;
++}
++
++static inline uintptr_t list_node_low48(list_node_t *node) {
++  uintptr_t pval = (uintptr_t)node;
++
++  assert((pval & ((uintptr_t)0xffff << 48)) == 0);
++  return pval & ((1ULL << 48) - 1);
++}
++
++static inline void list_remove(list_head_t *head, list_node_t *node) {
++  pthread_mutex_lock(&head->mutex);
++  if (node->prev != node && node->next != node) {
++    node->prev->next = node->next;
++    node->next->prev = node->prev;
++    node->prev = node;
++    node->next = node;
++  }
++  pthread_mutex_unlock(&head->mutex);
++}
++
++static inline void list_insert(list_head_t *head, list_node_t *node) {
++  pthread_mutex_lock(&head->mutex);
++  node->next = head->head.next;
++  node->prev = &head->head;
++  head->head.next->prev = node;
++  head->head.next = node;
++  pthread_mutex_unlock(&head->mutex);
++}
++
++static list_node_t *list_pop_front(list_head_t *head) {
++  list_node_t *node = NULL;
++  pthread_mutex_lock(&head->mutex);
++  if (head->head.next != &head->head) {
++    node = head->head.next;
++    node->prev->next = node->next;
++    node->next->prev = node->prev;
++    node->prev = node;
++    node->next = node;
++  }
++  pthread_mutex_unlock(&head->mutex);
++  return node;
++}
++
++/************************** free_ring_t definition ****************************/
++
++static free_ring_t free_ring_queue;
++
++static void free_ring_init(free_ring_t *fr) {
++  fr->head = fr->tail = 0;
++  pthread_mutex_init(&fr->mutex, NULL);
++}
++
++static inline int free_ring_full(free_ring_t *fr) {
++  return (fr->tail + 1) % RING_SIZE == fr->head;
++}
++
++static inline int free_ring_empty(free_ring_t *fr) {
++  return fr->head == fr->tail;
++}
++
++static inline void *free_ring_pop(free_ring_t *fr) {
++  void *ptr = fr->ring[fr->head];
++  fr->head = (fr->head + 1) % RING_SIZE;
++
++  return ptr;
++}
++
++static inline void free_ring_push(free_ring_t *fr, void *ptr) {
++  fr->ring[fr->tail] = ptr;
++  fr->tail = (fr->tail + 1) % RING_SIZE;
++}
++
++static inline void *free_ring_pop_when_full(free_ring_t *fr) {
++  if (free_ring_full(fr)) {
++    return free_ring_pop(fr);
++  }
++  return NULL;
++}
++
++static inline int free_ring_count(free_ring_t *fr) {
++  return (fr->tail - fr->head + RING_SIZE) % RING_SIZE;
++}
++
++static void *free_ring_push_and_pop(free_ring_t *fr, void *ptr) {
++  void *old;
++
++  pthread_mutex_lock(&fr->mutex);
++  old = free_ring_pop_when_full(fr);
++  free_ring_push(fr, ptr);
++  pthread_mutex_unlock(&fr->mutex);
++
++  return old;
++}
++
++/*************************** allocator definition *****************************/
++
++static void setup_internal(void) {
++#ifdef DEBUG
++  atomic_store(&c_alloc_count, 0);
++  atomic_store(&r_alloc_count, 0);
++  atomic_store(&c_free_count, 0);
++  atomic_store(&r_free_count, 0);
++#endif
++  free_ring_init(&free_ring_queue);
++
++  list_node_init(&alloc_list.head);
++  pthread_mutex_init(&alloc_list.mutex, NULL);
++
++  libc_malloc = dlsym(RTLD_NEXT, "malloc");
++  libc_free = dlsym(RTLD_NEXT, "free");
++  libc_realloc = dlsym(RTLD_NEXT, "realloc");
++}
++
++static void fill_red_zone(void *ptr) {
++  unsigned *p = (unsigned *)ptr;
++  int len = RED_ZONE_SIZE / sizeof(unsigned);
++  for (int i = 0; i < len; i++)
++    p[i] = RED_ZONE_PATTERN;
++}
++
++static inline header_t *get_header(void *ptr) {
++  header_t *header =
++      (header_t *)((uintptr_t)ptr - sizeof(header_t) - RED_ZONE_SIZE);
++  return header->cps.magic == HEADER_MAGIC ? header : NULL;
++}
++
++static void *get_raw_ptr(header_t *header) {
++  uintptr_t data;
++
++  data = (uintptr_t)header + sizeof(header_t) + RED_ZONE_SIZE;
++  return (void *)(data - header->offset);
++}
++
++static size_t calc_alloc_size(size_t size, size_t align) {
++  return size + sizeof(header_t) + RED_ZONE_SIZE * 2 + (align - 1);
++}
++
++static void *align_to(void *ptr, size_t align) {
++  size_t mask = align - 1;
++  return (void *)(((uintptr_t)ptr + mask) & ~mask);
++}
++
++static void *fill_metadata_and_take_data_ptr(void *ptr, size_t size,
++                                             size_t align, unsigned f_alloc) {
++  char *data, *first_red_zone, *second_red_zone;
++  header_t *header;
++
++  data = (char *)align_to(
++      (void *)((uintptr_t)ptr + sizeof(header_t) + RED_ZONE_SIZE), align);
++  first_red_zone = data - RED_ZONE_SIZE;
++  second_red_zone = data + size;
++
++  fill_red_zone(first_red_zone);
++  fill_red_zone(second_red_zone);
++
++  header = (header_t *)(first_red_zone - sizeof(header_t));
++  memset(header, 0, sizeof(header_t));
++
++  header->data_size = size;
++  header->offset = (uintptr_t)data - (uintptr_t)ptr;
++  header->cps.magic = HEADER_MAGIC;
++  header->cps.f_alloc = f_alloc;
++
++  safe_log("++ size %d raw %p  header %p fz %p data %p sz %p\n", size, ptr,
++           header, first_red_zone, data, second_red_zone);
++
++  return data;
++}
++
++static void *malloc_impl(size_t size, size_t align, unsigned f_alloc) {
++  pthread_once(&init_once, setup_internal);
++
++  size_t alloc_size;
++  void *ptr, *data;
++
++  safe_log("libmalloc %p\n", libc_malloc);
++
++  alloc_size = calc_alloc_size(size, align);
++  ptr = libc_malloc(alloc_size);
++  data = fill_metadata_and_take_data_ptr(ptr, size, align, f_alloc);
++
++  return data;
++}
++
++static int free_impl(void *data, unsigned f_free) {
++  pthread_once(&init_once, setup_internal);
++
++  void *old;
++  header_t *header;
++
++  if (!data)
++    return 0;
++
++  header = get_header(data);
++  if (!header) { // not alloc by us
++    safe_log("header is nil %p\n", data);
++    libc_free(data);
++    return 0;
++  }
++
++  header->cps.f_free = f_free;
++
++  if (header->cps.alloc_list != 0) {
++    list_node_t *node = (list_node_t *)(uintptr_t)header->cps.alloc_list;
++    list_remove(&alloc_list, node);
++    libc_free(node);
++    header->cps.alloc_list = 0;
++  }
++
++  safe_log("-- size %d header %p data %p\n", header->data_size, header, data);
++
++  old = free_ring_push_and_pop(&free_ring_queue, data);
++  if (old) {
++    header = get_header(old);
++    header->cps.magic = 0;
++    libc_free(get_raw_ptr(header));
++    return 1;
++  }
++  return 0;
++}
++
++static void *realloc_impl(void *ptr, size_t size, unsigned f_alloc) {
++  void *new_data;
++  header_t *header;
++  unsigned f_free;
++
++  safe_log("realloc size %d ptr %p\n", size, ptr);
++
++  if (!ptr) {
++    return malloc(size);
++  }
++  if (!size) {
++    free(ptr);
++    return NULL;
++  }
++
++  header = get_header(ptr);
++  if (!header) {
++    safe_log("realloc no header %p\n", ptr);
++    return libc_realloc(ptr, size);
++  }
++
++  if (f_alloc == F_ALLOC_R) {
++    f_free = F_FREE_R;
++  } else {
++    f_free = F_FREE_C;
++  }
++
++  new_data = malloc_impl(size, DEFAULT_ALIGN, f_alloc);
++  memcpy(new_data, ptr, size < header->data_size ? size : header->data_size);
++
++  free_impl(ptr, f_free);
++  return new_data;
++}
++
++static void *calloc_impl(size_t nitems, size_t size, unsigned f_alloc) {
++  size_t real_size = nitems * size;
++  void *data;
++
++  data = malloc_impl(real_size, DEFAULT_ALIGN, f_alloc);
++  memset(data, 0, real_size);
++  atomic_fetch_add(&c_alloc_count, 1);
++
++  return data;
++}
++
++static int posix_memalign_impl(void **memptr, size_t alignment, size_t size,
++                               unsigned f_alloc) {
++  if ((alignment & (alignment - 1)) != 0 || alignment == 0) {
++    return EINVAL;
++  }
++
++  void *ptr = malloc_impl(size, alignment, f_alloc);
++  if (!ptr) {
++    return ENOMEM;
++  }
++
++  *memptr = ptr;
++  return 0;
++}
++
++void *malloc(size_t size) {
++  void *data;
++
++  data = malloc_impl(size, DEFAULT_ALIGN, F_ALLOC_C);
++  atomic_fetch_add(&c_alloc_count, 1);
++  return data;
++}
++
++void free(void *ptr) {
++  if (free_impl(ptr, F_FREE_C)) {
++    atomic_fetch_add(&c_free_count, 1);
++  }
++}
++
++void *realloc(void *ptr, size_t size) {
++  return realloc_impl(ptr, size, F_ALLOC_C);
++}
++
++void *calloc(size_t nitems, size_t size) {
++  return calloc_impl(nitems, size, F_ALLOC_C);
++}
++
++int posix_memalign(void **memptr, size_t alignment, size_t size) {
++  return posix_memalign_impl(memptr, alignment, size, F_ALLOC_C);
++}
++
++void *aligned_alloc(size_t alignment, size_t size) {
++  pthread_once(&init_once, setup_internal);
++
++  if ((size & (alignment - 1)) != 0) {
++    errno = EINVAL;
++    return NULL;
++  }
++  return malloc_impl(size, alignment, F_ALLOC_C);
++}
++
++void *memalign(size_t alignment, size_t size) {
++  pthread_once(&init_once, setup_internal);
++
++  void *ptr;
++  if (posix_memalign(&ptr, alignment, size) != 0) {
++    return NULL;
++  }
++  return ptr;
++}
++
++void *__ffi_sanitizer_rust_alloc(size_t size) {
++  void *data;
++
++  data = malloc_impl(size, DEFAULT_ALIGN, F_ALLOC_R);
++  atomic_fetch_add(&r_alloc_count, 1);
++  return data;
++}
++
++void __ffi_sanitizer_rust_free(void *ptr) {
++  if (free_impl(ptr, F_FREE_R)) {
++    atomic_fetch_add(&r_free_count, 1);
++  }
++}
++
++void *__ffi_sanitizer_rust_realloc(void *ptr, size_t size) {
++  return realloc_impl(ptr, size, F_ALLOC_R);
++}
++
++void *__ffi_sanitizer_rust_calloc(size_t nitems, size_t size) {
++  return calloc_impl(nitems, size, F_ALLOC_R);
++}
++
++int __ffi_sanitizer_rust_posix_memalign(void **memptr, size_t alignment,
++                                        size_t size) {
++  return posix_memalign_impl(memptr, alignment, size, F_ALLOC_R);
++}
++
++header_t *__ffi_sanitizer_get_header(void *ptr) {
++  if (ptr)
++    return get_header(ptr);
++  return NULL;
++}
++
++void __ffi_sanitizer_put_alloc_list(void *data, char *file, unsigned len,
++                                    unsigned line) {
++  header_t *header;
++  list_node_t *node;
++
++  header = get_header(data);
++  if (!header)
++    return;
++
++  if (header->cps.alloc_list != 0) {
++    node = (list_node_t *)(uintptr_t)header->cps.alloc_list;
++    list_remove(&alloc_list, node);
++    node->last_file = file;
++    node->len = len;
++    node->last_line = line;
++  } else {
++    node = list_new_node(data, file, len, line);
++    header->cps.alloc_list = list_node_low48(node);
++  }
++  list_insert(&alloc_list, node);
++}
++
++int __ffi_sanitizer_print_leak_summary() {
++  list_node_t *node;
++  header_t *header;
++  int leaked = 0;
++
++  for (node = list_pop_front(&alloc_list); node;
++       node = list_pop_front(&alloc_list)) {
++    leaked = 1;
++
++    printf("FFI Probe: memory leak detected, addr: %p, may be around %.*s:%u\n",
++           node->self, node->len, node->last_file, node->last_line);
++    header = get_header(node->self);
++    if (header)
++      header->cps.alloc_list = 0;
++    libc_free(node);
++  }
++
++  return leaked;
++}
++
++int __ffi_sanitizer_check_red_zone(void *ptr) {
++  header_t *header;
++  unsigned *first, *second;
++
++  if (!ptr)
++    return 0;
++  header = get_header(ptr);
++
++  first = (unsigned *)((uintptr_t)ptr - RED_ZONE_SIZE);
++  second = (unsigned *)((uintptr_t)ptr + header->data_size);
++
++  for (size_t i = 0; i < RED_ZONE_SIZE / sizeof(unsigned); i++) {
++    if (first[i] != RED_ZONE_PATTERN || second[i] != RED_ZONE_PATTERN)
++      return 1;
++  }
++  return 0;
++}
++
++__attribute__((destructor)) void cleanup(void) {
++#ifdef DEBUG
++  int buffered = free_ring_count(&free_ring_queue);
++  int alloc_count = atomic_load(&c_alloc_count) + atomic_load(&r_alloc_count);
++  int free_count = atomic_load(&c_free_count) + atomic_load(&r_free_count);
++  safe_log("alloc : %d free: %d real free: %d buffered: %d\n", alloc_count,
++           free_count + buffered, free_count, buffered);
++#endif
++}
+\ No newline at end of file
+diff --git a/library/core/src/libffisan/mod.rs b/library/core/src/libffisan/mod.rs
+new file mode 100644
+index 00000000..8b3680e8
+--- /dev/null
++++ b/library/core/src/libffisan/mod.rs
+@@ -0,0 +1,6 @@
++#![allow(non_upper_case_globals)]
++#![allow(non_camel_case_types)]
++#![allow(non_snake_case)]
++#![allow(missing_debug_implementations)]
++
++include!("bindings.rs");
+\ No newline at end of file
+diff --git a/library/std/src/lib.rs b/library/std/src/lib.rs
+index a8c50cec..3f7f4a22 100644
+--- a/library/std/src/lib.rs
++++ b/library/std/src/lib.rs
+@@ -410,6 +410,7 @@
+ #![feature(log_syntax)]
+ #![feature(test)]
+ #![feature(trace_macros)]
++#![feature(libffisan)]
+ // tidy-alphabetical-end
+ //
+ // Only used in tests/benchmarks:
+diff --git a/library/std/src/sys/alloc/ffi_sanitizer.rs b/library/std/src/sys/alloc/ffi_sanitizer.rs
+new file mode 100644
+index 00000000..376eb224
+--- /dev/null
++++ b/library/std/src/sys/alloc/ffi_sanitizer.rs
+@@ -0,0 +1,76 @@
++use core::libffisan::F_ALLOC_C;
++use core::{ffi, libffisan};
++
++use super::{MIN_ALIGN, realloc_fallback};
++use crate::alloc::{GlobalAlloc, Layout, System};
++use crate::ptr;
++
++#[stable(feature = "alloc_system_type", since = "1.28.0")]
++unsafe impl GlobalAlloc for System {
++    #[inline]
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
++            unsafe { libffisan::__ffi_sanitizer_rust_alloc(layout.size()) as *mut u8 }
++        } else {
++            unsafe { aligned_malloc(&layout) }
++        }
++    }
++
++    #[inline]
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        // See the comment above in `alloc` for why this check looks the way it does.
++        if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
++            unsafe { libffisan::__ffi_sanitizer_rust_calloc(layout.size(), 1) as *mut u8 }
++        } else {
++            let ptr = unsafe { self.alloc(layout) };
++            if !ptr.is_null() {
++                unsafe { ptr::write_bytes(ptr, 0, layout.size()) };
++            }
++            ptr
++        }
++    }
++
++    #[inline]
++    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
++        unsafe { 
++            let header = libffisan::__ffi_sanitizer_get_header(ptr as *mut ffi::c_void);
++            if !header.is_null() {
++                let header = &*header;
++                if header.cps.f_free() != 0 {
++                    panic!("FFI Probe: double free detected");
++                }
++                if header.cps.f_alloc() == F_ALLOC_C {
++                    panic!("FFI Probe: undefind behavior: object alloc in C but dealloc in Rust");
++                }
++            }
++            libffisan::__ffi_sanitizer_rust_free(ptr as *mut libc::c_void) 
++        }
++    }
++
++    #[inline]
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        if layout.align() <= MIN_ALIGN && layout.align() <= new_size {
++            unsafe {
++                libffisan::__ffi_sanitizer_rust_realloc(ptr as *mut libc::c_void, new_size)
++                    as *mut u8
++            }
++        } else {
++            unsafe { realloc_fallback(self, ptr, layout, new_size) }
++        }
++    }
++}
++
++unsafe fn aligned_malloc(layout: &Layout) -> *mut u8 {
++    let mut out = ptr::null_mut();
++    // We prefer posix_memalign over aligned_alloc since it is more widely available, and
++    // since with aligned_alloc, implementations are making almost arbitrary choices for
++    // which alignments are "supported", making it hard to use. For instance, some
++    // implementations require the size to be a multiple of the alignment (wasi emmalloc),
++    // while others require the alignment to be at least the pointer size (Illumos, macOS).
++    // posix_memalign only has one, clear requirement: that the alignment be a multiple of
++    // `sizeof(void*)`. Since these are all powers of 2, we can just use max.
++    let align = layout.align().max(size_of::<usize>());
++    let ret =
++        unsafe { libffisan::__ffi_sanitizer_rust_posix_memalign(&mut out, align, layout.size()) };
++    if ret != 0 { ptr::null_mut() } else { out as *mut u8 }
++}
+diff --git a/library/std/src/sys/alloc/mod.rs b/library/std/src/sys/alloc/mod.rs
+index f2f1d1c7..47ec6179 100644
+--- a/library/std/src/sys/alloc/mod.rs
++++ b/library/std/src/sys/alloc/mod.rs
+@@ -75,7 +75,8 @@ unsafe fn realloc_fallback(
+         target_os = "teeos",
+         target_os = "trusty",
+     ) => {
+-        mod unix;
++        // mod unix;
++        mod ffi_sanitizer;
+     }
+     target_os = "windows" => {
+         mod windows;
