@@ -145,6 +145,7 @@ declare_passes! {
     mod elaborate_drops : ElaborateDrops;
     mod function_item_references : FunctionItemReferences;
     mod ffi_sanitizer : FFISanitizer;
+    mod ffi_race_sanitizer : FFIRaceSanitizer;
     mod gvn : GVN;
     // Made public so that `mir_drops_elaborated_and_const_checked` can be overridden
     // by custom rustc drivers, running all the steps by themselves. See #114628.
@@ -744,6 +745,7 @@ pub(crate) fn run_optimization_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'
             &multiple_return_terminators::MultipleReturnTerminators,
             &large_enums::EnumSizeOpt { discrepancy: 128 },
             &ffi_sanitizer::FFISanitizer,
+            &ffi_race_sanitizer::FFIRaceSanitizer,
             // Some cleanup necessary at least for LLVM and potentially other codegen backends.
             &add_call_guards::CriticalCallEdges,
             // Cleanup for human readability, off by default.

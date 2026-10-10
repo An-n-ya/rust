@@ -512,6 +512,8 @@ declare_features! (
     (unstable, ffi_pure, "1.45.0", Some(58329)),
     /// my  feature
     (unstable, ffi_sanitizer, "1.92.0", None),
+    /// FFI-boundary data race detection built on top of the ThreadSanitizer runtime.
+    (unstable, ffi_race_sanitizer, "1.92.0", None),
     /// Controlling the behavior of fmt::Debug
     (unstable, fmt_debug, "1.82.0", Some(129709)),
     /// Allows using `#[align(...)]` on function items

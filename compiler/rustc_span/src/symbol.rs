@@ -1042,6 +1042,7 @@ symbols! {
         ffi,
         ffi_const,
         ffi_sanitizer,
+        ffi_race_sanitizer,
         ffi_pure,
         ffi_returns_twice,
         field,
