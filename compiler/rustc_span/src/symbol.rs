@@ -1041,6 +1041,7 @@ symbols! {
         fetch_update,
         ffi,
         ffi_const,
+        ffi_sanitizer,
         ffi_pure,
         ffi_returns_twice,
         field,

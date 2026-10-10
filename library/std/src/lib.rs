@@ -412,6 +412,7 @@
 #![feature(log_syntax)]
 #![feature(test)]
 #![feature(trace_macros)]
+#![feature(libffisan)]
 // tidy-alphabetical-end
 //
 // Only used in tests/benchmarks:
